@@ -1,0 +1,22 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Logs/results from runs
+logs/
+results/
+
+# Backups/temp files
+*.bak
+*.backup
+*.before_*
+*.single_batch_backup
+
+# OS/editor junk
+.DS_Store
+.vscode/
+

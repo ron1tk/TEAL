@@ -61,8 +61,16 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     return probs
 
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    probs = logits_to_probs(logits[0, -1], temperature, top_k)
-    idx_next = multinomial_sample_one_no_sync(probs)
+    # Supports both:
+    #   logits: [B, T, vocab]
+    #   logits: [T, vocab] legacy-ish path
+    if logits.dim() == 3:
+        last_logits = logits[:, -1, :]      # [B, vocab]
+    else:
+        last_logits = logits[-1, :].unsqueeze(0)
+
+    probs = logits_to_probs(last_logits, temperature, top_k)
+    idx_next = multinomial_sample_one_no_sync(probs)  # [B, 1]
     return idx_next, probs
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
@@ -84,10 +92,10 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
                 model, cur_token, input_pos, **sampling_kwargs
             )
             input_pos += 1
-            new_tokens.append(next_token.clone())
+            new_tokens.append(next_token.clone())   # [B, 1]
             callback(new_tokens[-1])
             new_probs.append(next_prob.clone())
-            cur_token = next_token.view(1, -1)
+            cur_token = next_token.view(next_token.size(0), -1)  # [B, 1]
 
     return new_tokens, new_probs
 
@@ -154,6 +162,7 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
+    batch_size: int = 1,
     callback = lambda x: x,
     **sampling_kwargs
 ) -> torch.Tensor:
@@ -162,6 +171,12 @@ def generate(
     """
 
     is_speculative = draft_model is not None
+
+    if interactive and batch_size != 1:
+        raise ValueError("interactive mode currently only supports batch_size=1")
+    if is_speculative and batch_size != 1:
+        raise ValueError("speculative decoding currently only supports batch_size=1")
+
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(0)
     T_new = T + max_new_tokens
@@ -172,21 +187,27 @@ def generate(
 
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
-    with torch.device(device):
-        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
-        if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
-    # create an empty tensor of the expected final shape and fill in the current tokens
-    empty = torch.empty(T_new, dtype=dtype, device=device)
-    empty[:T] = prompt
+    with torch.device(device):
+        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+        if is_speculative and draft_model is not model:
+            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+
+    # Repeat same prompt across batch.
+    # This is static batching: B identical requests decoding in lockstep.
+    prompt_batch = prompt.unsqueeze(0).expand(batch_size, -1).contiguous()  # [B, T]
+
+    empty = torch.empty((batch_size, T_new), dtype=dtype, device=device)
+    empty[:, :T] = prompt_batch
     seq = empty
+
     input_pos = torch.arange(0, T, device=device)
 
-    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs).clone()
+    next_token = prefill(model, prompt_batch, input_pos, **sampling_kwargs).clone()  # [B, 1]
     if is_speculative:
-        prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
-    seq[T] = next_token
+        prefill(draft_model, prompt_batch, input_pos, **sampling_kwargs)
+
+    seq[:, T] = next_token.squeeze(-1)
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
@@ -208,8 +229,16 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        seq[T + 1:] = torch.cat(generated_tokens)
+        generated_tokens, _ = decode_n_tokens(
+            model,
+            next_token.view(batch_size, -1),
+            input_pos,
+            max_new_tokens - 1,
+            callback=callback,
+            **sampling_kwargs
+        )
+        if generated_tokens:
+            seq[:, T + 1:] = torch.cat(generated_tokens, dim=1)  # [B, max_new_tokens-1]
 
     generate_stats = {
         'accept_counts': accept_counts
@@ -257,6 +286,13 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
     from distribution import Distribution
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) # hack import parent dir
     from kernels.sparse_gemv import SparseGEMV, SparseQKVGEMV, DenseGEMV
+
+    batch_sparse_backend = os.environ.get("TEAL_BATCH_SPARSE_BACKEND", "original")
+
+    if batch_sparse_backend == "shared_gemm":
+        from kernels.shared_mask_gemm import SharedMaskGEMM, SharedMaskQKVGEMM
+    elif batch_sparse_backend == "shared_triton":
+        from kernels.shared_mask_sparse_gemm import SharedMaskSparseGEMM, SharedMaskSparseQKVGEMM
     from utils.utils import get_layer_greedy_sparsities
     sparse_levels = [sparsity]*len(model.layers)
     projs = ['q', 'k', 'v', 'o', 'up', 'gate', 'down']
@@ -288,7 +324,14 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
 
         is_sparse = True
 
-        layer.feed_forward.gemv1_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
+        if is_sparse and batch_sparse_backend == "shared_triton":
+            layer.feed_forward.gemv1_kernel = SharedMaskSparseGEMM.initialize("shared_mask_sparse_gemm", device)
+        elif is_sparse and batch_sparse_backend == "shared_gemm":
+            layer.feed_forward.gemv1_kernel = SharedMaskGEMM.initialize("shared_mask_gemm", device)
+        elif is_sparse:
+            layer.feed_forward.gemv1_kernel = SparseGEMV.initialize("sparse_gemv", device)
+        else:
+            layer.feed_forward.gemv1_kernel = DenseGEMV.initialize("dense_gemv", device)
         layer.feed_forward.gemv1 = layer.feed_forward.gemv1_kernel.operator(True)
         layer.feed_forward.thresh_up = sparses["up"]
         layer.feed_forward.thresh_gate = sparses["gate"]
@@ -296,13 +339,27 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.feed_forward.w1.weight.data = layer.feed_forward.w1.weight.data.T.contiguous().T # column major
         layer.feed_forward.w3.weight.data = layer.feed_forward.w3.weight.data.T.contiguous().T # column major
 
-        layer.feed_forward.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
+        if is_sparse and batch_sparse_backend == "shared_triton":
+            layer.feed_forward.gemv2_kernel = SharedMaskSparseGEMM.initialize("shared_mask_sparse_gemm", device)
+        elif is_sparse and batch_sparse_backend == "shared_gemm":
+            layer.feed_forward.gemv2_kernel = SharedMaskGEMM.initialize("shared_mask_gemm", device)
+        elif is_sparse:
+            layer.feed_forward.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device)
+        else:
+            layer.feed_forward.gemv2_kernel = DenseGEMV.initialize("dense_gemv", device)
         layer.feed_forward.gemv2 = layer.feed_forward.gemv2_kernel.operator(True)
         layer.feed_forward.thresh_down = sparses["down"]
         layer.feed_forward.sparsity_bin = 0
         layer.feed_forward.w2.weight.data = layer.feed_forward.w2.weight.data.T.contiguous().T # column major
 
-        layer.attention.gemv1_kernel = SparseQKVGEMV.initialize("sparse_qkv_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
+        if is_sparse and batch_sparse_backend == "shared_triton":
+            layer.attention.gemv1_kernel = SharedMaskSparseQKVGEMM.initialize("shared_mask_sparse_qkv_gemm", device)
+        elif is_sparse and batch_sparse_backend == "shared_gemm":
+            layer.attention.gemv1_kernel = SharedMaskQKVGEMM.initialize("shared_mask_qkv_gemm", device)
+        elif is_sparse:
+            layer.attention.gemv1_kernel = SparseQKVGEMV.initialize("sparse_qkv_gemv", device)
+        else:
+            layer.attention.gemv1_kernel = DenseGEMV.initialize("dense_gemv", device)
         layer.attention.gemv1 = layer.attention.gemv1_kernel.operator(True)
         layer.attention.thresh_q = sparses["q"]
         layer.attention.thresh_k = sparses["k"]
@@ -310,7 +367,14 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
         layer.attention.sparsity_bin = 0
         layer.attention.wqkv.weight.data = layer.attention.wqkv.weight.data.T.contiguous().T # column major
 
-        layer.attention.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device) if is_sparse else DenseGEMV.initialize("dense_gemv", device)
+        if is_sparse and batch_sparse_backend == "shared_triton":
+            layer.attention.gemv2_kernel = SharedMaskSparseGEMM.initialize("shared_mask_sparse_gemm", device)
+        elif is_sparse and batch_sparse_backend == "shared_gemm":
+            layer.attention.gemv2_kernel = SharedMaskGEMM.initialize("shared_mask_gemm", device)
+        elif is_sparse:
+            layer.attention.gemv2_kernel = SparseGEMV.initialize("sparse_gemv", device)
+        else:
+            layer.attention.gemv2_kernel = DenseGEMV.initialize("dense_gemv", device)
         layer.attention.gemv2 = layer.attention.gemv2_kernel.operator(True)
         layer.attention.thresh_o = sparses["o"]
         layer.attention.sparsity_bin = 0
@@ -322,10 +386,11 @@ def _load_model(checkpoint_path, device, precision, use_tp, hist_path, sparsity)
 
         torch.cuda.empty_cache()
 
-    print("Monkeypatching with activation sparsity...")
-    print(model.layers[0].feed_forward.w1.weight.data.shape)
+   
     from tp import _get_rank
     if hist_path is not None:
+        print("Monkeypatching with activation sparsity...")
+        print(model.layers[0].feed_forward.w1.weight.data.shape)
         device = model.layers[0].feed_forward.w1.weight.device.type
         for layer_idx, layer in enumerate(model.layers):
             monkeypatch_layer(layer_idx, layer, sparsity, hist_path, device)     
@@ -361,6 +426,7 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    batch_size: int = 1,
 
     # monkeypatch
     hist_path: str = None,
@@ -383,6 +449,8 @@ def main(
             print = lambda *args, **kwargs: None
 
     print(f"Using device={device}")
+    print(f"Batch size: {batch_size}")
+    print(f"TEAL batch sparse backend: {os.environ.get('TEAL_BATCH_SPARSE_BACKEND', 'original')}")
     precision = torch.float16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
@@ -408,6 +476,13 @@ def main(
 
     torch.manual_seed(1234)
     model_size = _get_model_size(model)
+
+    # shared_gemm uses PyTorch-side dynamic masking/index_select inside custom ops.
+    # CUDA graph capture does not allow GPU -> CPU syncs like bool(mask.any()).
+    # Keep torch.compile, but disable cudagraph trees for this experimental backend.
+    if os.environ.get("TEAL_BATCH_SPARSE_BACKEND", "original") == "shared_gemm":
+        torch._inductor.config.triton.cudagraph_trees = False
+
     if compile:
         if is_speculative and use_tp: # and ("cuda" in device):
             torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
@@ -469,6 +544,7 @@ def main(
                 max_new_tokens,
                 draft_model=draft_model,
                 speculate_k=speculate_k,
+                batch_size=batch_size,
                 interactive=interactive,
                 callback=callback,
                 temperature=temperature,
@@ -487,13 +563,23 @@ def main(
         t = time.perf_counter() - t0
 
         if not interactive:
-            print(tokenizer.decode(y.tolist()))
+            # Only print first batch element to avoid huge logs.
+            if y.dim() == 2:
+                print(tokenizer.decode(y[0].tolist()))
+            else:
+                print(tokenizer.decode(y.tolist()))
         else:
             print()
-        tokens_generated = y.size(0) - prompt_length
+
+        if y.dim() == 2:
+            tokens_generated = y.size(0) * (y.size(1) - prompt_length)  # total batch tokens
+        else:
+            tokens_generated = y.size(0) - prompt_length
+
         tokens_sec = tokens_generated / t
         aggregate_metrics['tokens_per_sec'].append(tokens_sec)
-        print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
+        print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} total tokens/sec")
+        print(f"Per-request tokens/sec: {tokens_sec / batch_size:.02f}")
         print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
     print("==========")
     if is_speculative:
@@ -542,6 +628,7 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
+    parser.add_argument('--batch_size', type=int, default=1, help='Static batch size for non-interactive decoding.')
 
     # monkeypatch
     parser.add_argument('--hist_path', type=str, default=None, help='Histogram path.')
@@ -551,7 +638,7 @@ if __name__ == '__main__':
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device, 
+        args.speculate_k, args.device, args.batch_size,
         
         # monkeypatch
         args.hist_path, args.sparsity,
